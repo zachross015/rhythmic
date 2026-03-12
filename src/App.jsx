@@ -2,8 +2,38 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 
 const NOTES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const toDay=()=>new Date().toISOString().split('T')[0];
-const MAX_ATT=25;
 const MAX_LV=100;
+const BASE_ENERGY=25;
+const ENERGY_REGEN_MS=5*60*1000; // 1 point per 5 minutes
+const ENERGY_PER_5_LEVELS=1; // +1 max energy per 5 levels (per mode)
+
+// Compute bonus max energy from all mode levels
+function bonusMaxEnergy(xpByMode){
+  const xm=xpByMode||EMPTY_XPM();
+  return Object.keys(xm).reduce((sum,m)=>{
+    const lv=levelFromXp(xm[m]);
+    return sum+Math.floor(lv/5)*ENERGY_PER_5_LEVELS;
+  },0);
+}
+function maxEnergy(xpByMode){return BASE_ENERGY+bonusMaxEnergy(xpByMode);}
+
+// Energy persistence
+async function loadEnergy(){
+  try{const v=await S.get('rt3:energy');return v||{cur:BASE_ENERGY,lastRegen:Date.now()};}catch{return{cur:BASE_ENERGY,lastRegen:Date.now()};}
+}
+async function saveEnergy(e){await S.set('rt3:energy',e);}
+// Apply offline regen and return updated energy object
+function applyRegen(e,maxE){
+  const now=Date.now();
+  const elapsed=now-(e.lastRegen||now);
+  const gained=Math.floor(elapsed/ENERGY_REGEN_MS);
+  if(gained<=0)return{...e,lastRegen:e.lastRegen||now};
+  const newCur=Math.min(maxE,e.cur+gained);
+  // advance lastRegen by the consumed intervals only
+  const consumed=newCur-e.cur;
+  const newLastRegen=(e.lastRegen||now)+consumed*ENERGY_REGEN_MS;
+  return{cur:newCur,lastRegen:newLastRegen};
+}
 
 const S={
   async get(k,sh=false){try{const r=await localStorage.getItem(k,sh);return r?JSON.parse(r):null}catch{return null}},
@@ -24,8 +54,6 @@ async function loadHistory(uid){try{return(await S.get('rt3:hist:'+uid))||[]}cat
 async function saveHistory(uid,entry){try{const h=(await S.get('rt3:hist:'+uid))||[];const i=h.findIndex(e=>e.date===entry.date);i>=0?(h[i].total=Math.max(h[i].total,entry.total)):h.push(entry);await S.set('rt3:hist:'+uid,h.slice(-60));}catch{}}
 async function loadLB(){try{return(await S.get('rt3:lb:'+toDay(),true))||[]}catch{return[];}}
 async function submitLB(p,total){if(!p?.name)return;try{const b=(await S.get('rt3:lb:'+toDay(),true))||[];const i=b.findIndex(e=>e.id===p.id);const e={id:p.id,name:p.name,total,ts:Date.now()};i>=0?b[i]=e:b.push(e);b.sort((a,b)=>b.total-a.total);await S.set('rt3:lb:'+toDay(),b.slice(0,100),true);}catch{}}
-async function loadDailyAttempts(){try{return(await S.get('rt3:da:'+toDay()))||{intervals:0,chords:0,scales:0,progressions:0,tempo:0}}catch{return{intervals:0,chords:0,scales:0,progressions:0,tempo:0};}}
-async function saveDailyAttempts(d){await S.set('rt3:da:'+toDay(),d);}
 async function loadDailyScore(){try{const v=await S.get('rt3:ds:'+toDay());return v||0}catch{return 0;}}
 async function saveDailyScore(s){await S.set('rt3:ds:'+toDay(),s);}
 const EMPTY_STATS=()=>({intervals:{s:0,f:0},chords:{s:0,f:0},scales:{s:0,f:0},progressions:{s:0,f:0},tempo:{s:0,f:0}});
@@ -176,7 +204,7 @@ function getContent(xpByMode){
     chords:{...ch,on:ivLv>=20&&ch.pool.length>0},
     scales:{...sc,on:ivLv>=10&&sc.pool.length>0},
     progressions:{...pg,on:chLv>=10&&pg.pool.length>0},
-    tempo:{pool:[],choices:0,keyStage:0,dirOn:false,on:ivLv>=8},
+    tempo:{pool:[],choices:0,keyStage:0,dirOn:false,on:ivLv>=30},
     dirOn:iv.dirOn, scaleDirOn:sc.dirOn,
     modeLevels:{intervals:ivLv,chords:chLv,scales:scLv,progressions:pgLv,tempo:tpLv},
   };
@@ -737,16 +765,49 @@ const Styles=()=>(<style>{`
   .tempo-in:focus{border-color:#405147;}
   .tempo-sub{padding:9px 16px;background:#405147;color:#F2EEE6;border:none;border-radius:10px;font-family:'Work Sans',sans-serif;font-size:12px;font-weight:600;cursor:pointer;}
   .tempo-sub:disabled{opacity:.5;cursor:default;}
+  /* ── energy ── */
+  .energy-row{display:flex;align-items:center;gap:7px;}
+  .energy-bar-track{flex:1;height:7px;background:rgba(255,255,255,.15);border-radius:4px;overflow:hidden;}
+  .energy-bar-fill{height:100%;border-radius:4px;transition:width .4s ease;}
+  .energy-label{font-size:9px;font-weight:700;color:#C6A585;white-space:nowrap;font-family:'Work Sans',sans-serif;}
+  .energy-timer{font-size:9px;color:rgba(156,183,177,.7);white-space:nowrap;font-family:'Work Sans',sans-serif;}
 `}</style>);
+
+function EnergyBar({energy,maxE,regenMs}){
+  const[now,setNow]=useState(Date.now());
+  useEffect(()=>{
+    if(energy>=maxE)return;
+    const id=setInterval(()=>setNow(Date.now()),1000);
+    return()=>clearInterval(id);
+  },[energy,maxE]);
+  const msSinceLast=(now-(regenMs||now))%ENERGY_REGEN_MS;
+  const msToNext=energy<maxE?Math.max(0,ENERGY_REGEN_MS-msSinceLast):0;
+  const mm=Math.floor(msToNext/60000);const ss=Math.floor((msToNext%60000)/1000);
+  const timerStr=energy<maxE?`${mm}:${ss.toString().padStart(2,'0')}`:null;
+  // clamp fill to 100% visually; over-cap shown as teal
+  const overCap=energy>maxE;
+  const pct=overCap?100:Math.round(energy/maxE*100);
+  const fillColor=overCap?'#9CB7B1':'#C6A585';
+  return(
+    <div className='energy-row'>
+      <span style={{fontSize:11,lineHeight:1}}>⚡</span>
+      <div className='energy-bar-track'>
+        <div className='energy-bar-fill' style={{width:pct+'%',background:fillColor}}/>
+      </div>
+      <span className='energy-label'>{energy}/{maxE}</span>
+      {timerStr&&<span className='energy-timer'>{timerStr}</span>}
+    </div>
+  );
+}
 
 const MODE_DEFS=[
   {id:'intervals',   icon:'↔', label:'Intervals',    desc:'The building blocks — distance between two notes.'},
-  {id:'tempo',       icon:'♩', label:'Tempo',        desc:'The pulse — BPM recognition and inner metronome.',      req:'Intervals Lv 8'},
   {id:'scales',      icon:'〜',label:'Scales',        desc:'Seven notes that feel like home — melody lives here.',  req:'Intervals Lv 10'},
   {id:'chords',      icon:'♪', label:'Chords',       desc:'Three or more notes combined — harmony in a moment.',  req:'Intervals Lv 20'},
+  {id:'tempo',       icon:'♩', label:'Tempo',        desc:'The pulse — BPM recognition and inner metronome.',      req:'Intervals Lv 30'},
   {id:'progressions',icon:'♫', label:'Progressions', desc:'Chords in motion — the harmonic sentence.',             req:'Chords Lv 10'},
 ];
-function SubjectHub({xpByMode,profile,lb,history,dailyScore,dailyAttempts,onSelect}){
+function SubjectHub({xpByMode,profile,lb,history,dailyScore,energy,maxE,regenMs,onSelect}){
   const[showGlobalStats,setShowGlobalStats]=useState(false);
   const content=getContent(xpByMode);
   const ml=content.modeLevels;
@@ -767,12 +828,18 @@ function SubjectHub({xpByMode,profile,lb,history,dailyScore,dailyAttempts,onSele
             </button>
             <div style={{textAlign:'right'}}>
               <div style={{display:'flex',alignItems:'center',justifyContent:'flex-end',gap:6}}>
-                {profile?.streak>0&&<StreakBadge streak={profile.streak} size={34}/>}
                 <div style={{fontFamily:"'Fraunces',serif",fontSize:22,fontWeight:700,color:'#C6A585',lineHeight:1}}>{(dailyScore||0).toLocaleString()}</div>
               </div>
               <div style={{fontSize:9,color:'#9CB7B1',marginTop:2,letterSpacing:.5,textTransform:'uppercase'}}>Today{myRank>0?` · #${myRank}`:''}</div>
             </div>
           </div>
+        </div>
+      </div>
+      {/* Streak + energy bar below main title row */}
+      <div style={{background:'#405147',padding:'0 20px 14px'}}>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <StreakBadge streak={profile?.streak||0} size={34}/>
+          <div style={{flex:1}}><EnergyBar energy={energy} maxE={maxE} regenMs={regenMs}/></div>
         </div>
       </div>
       {/* Mode cards */}
@@ -781,9 +848,8 @@ function SubjectHub({xpByMode,profile,lb,history,dailyScore,dailyAttempts,onSele
           const on=content[md.id]?.on||md.id==='intervals';
           const lv=ml[md.id]||0;
           const{pct,cur,need}=xpToNext(xpByMode?.[md.id]||0);
-          const att=dailyAttempts?.[md.id]||0;const attDone=att>=MAX_ATT;
-          return(<div key={md.id} onClick={()=>on&&onSelect('earTraining',md.id)}
-            style={{background:'white',borderRadius:18,padding:'16px 18px',cursor:on?'pointer':'default',border:'1.5px solid '+(on?'transparent':'#BEC9A6'),boxShadow:on?'0 3px 16px rgba(64,81,71,.09)':undefined,opacity:on?1:.55,position:'relative',overflow:'hidden'}}>
+          return(<div key={md.id} onClick={()=>on&&energy>0&&onSelect('earTraining',md.id)}
+            style={{background:'white',borderRadius:18,padding:'16px 18px',cursor:on&&energy>0?'pointer':'default',border:'1.5px solid '+(on?'transparent':'#BEC9A6'),boxShadow:on?'0 3px 16px rgba(64,81,71,.09)':undefined,opacity:on?1:.55,position:'relative',overflow:'hidden'}}>
             {on&&<div style={{position:'absolute',top:0,right:0,width:60,height:60,background:'#D1E1DD',borderRadius:'0 18px 0 60px',opacity:.4}}/>}
             <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:8}}>
               <div style={{display:'flex',alignItems:'center',gap:8}}>
@@ -793,10 +859,10 @@ function SubjectHub({xpByMode,profile,lb,history,dailyScore,dailyAttempts,onSele
                   {on&&<div style={{fontSize:9,color:'#9CB7B1',marginTop:2}}>Level {lv}</div>}
                 </div>
               </div>
-              {on?(<div style={{display:'flex',alignItems:'center',gap:6}}>{attDone&&<span style={{fontSize:9,background:'#BEC9A6',color:'#405147',borderRadius:4,padding:'2px 6px',fontWeight:700}}>✓ Done</span>}<span style={{fontSize:11,color:'#405147',fontWeight:700}}>→</span></div>):(<span style={{fontSize:10,color:'#9CB7B1',background:'#F2EEE6',borderRadius:5,padding:'2px 7px'}}>{md.req}</span>)}
+              {on?(<div style={{display:'flex',alignItems:'center',gap:6}}><span style={{fontSize:11,color:'#405147',fontWeight:700}}>→</span></div>):(<span style={{fontSize:10,color:'#9CB7B1',background:'#F2EEE6',borderRadius:5,padding:'2px 7px'}}>{md.req}</span>)}
             </div>
             <div style={{fontSize:11,color:'#9CB7B1',lineHeight:1.5,marginBottom:on?10:0}}>{md.desc}</div>
-            {on&&(<div style={{height:3,background:'#F2EEE6',borderRadius:2,overflow:'hidden'}}><div style={{height:'100%',width:pct+'%',background:attDone?'#BEC9A6':'#C6A585',borderRadius:2,transition:'width .5s'}}/></div>)}
+            {on&&(<div style={{height:3,background:'#F2EEE6',borderRadius:2,overflow:'hidden'}}><div style={{height:'100%',width:pct+'%',background:'#C6A585',borderRadius:2,transition:'width .5s'}}/></div>)}
             {on&&need>0&&<div style={{fontSize:9,color:'#BEC9A6',marginTop:3}}>{cur}/{need} xp to Level {lv+1}</div>}
           </div>);
         })}
@@ -833,7 +899,7 @@ function SubjectHub({xpByMode,profile,lb,history,dailyScore,dailyAttempts,onSele
 
 const EMODES=[{id:'intervals',label:'Intervals',icon:'↔'},{id:'chords',label:'Chords',icon:'♪'},{id:'scales',label:'Scales',icon:'〜'},{id:'progressions',label:'Progs',icon:'♫'},{id:'tempo',label:'Tempo',icon:'♩'}];
 
-function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDailyScore,dailyAttempts,setDailyAttempts,initialMode,onBack,onScoreUpdate}){
+function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDailyScore,energy,setEnergy,maxE,regenMs,setRegenMs,initialMode,onBack,onScoreUpdate}){
   const[mode,setMode]          =useState(initialMode||'intervals');
   const[content,setContent]    =useState(()=>getContent(xpByMode));
   const[question,setQuestion]  =useState(null);
@@ -869,9 +935,7 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
   const modeXp=xpByMode?.[mode]||0;
   const modeLv=levelFromXp(modeXp);
   const modeXpInfo=xpToNext(modeXp);
-  const modeAtt=dailyAttempts?.[mode]||0;
-  const modeExhausted=modeAtt>=MAX_ATT;
-  const allExhausted=EMODES.filter(em=>content[em.id]?.on||em.id==='intervals').every(em=>(dailyAttempts?.[em.id]||0)>=MAX_ATT);
+  const energyEmpty=energy<=0;
 
   // Load data
   useEffect(()=>{
@@ -897,7 +961,7 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
     setSelected(null);setBounce(null);setTempoG('');setTempoD(false);setRevealed(false);revealedRef.current=false;
   },[round,mode,showIntro]);
 
-  // Per-mode level-up detection
+  // Per-mode level-up detection + energy rewards
   useEffect(()=>{
     const newLv=levelFromXp(xpByMode?.[mode]||0);
     const prevLv=prevLvsRef.current[mode]||1;
@@ -907,6 +971,15 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
         lvUpActiveRef.current=true;
         setLvUpQ(q=>[...q,{level:newLv,unlocks:gained,modeName:MODE_LABELS[mode]?.label||mode}]);
       }
+      // Award 5 energy per level gained; energy can exceed cap
+      const levelsGained=newLv-prevLv;
+      const newMaxE=maxEnergy(xpByMode);
+      const energyReward=levelsGained*5;
+      setEnergy(e=>{
+        const ne=e+energyReward; // may go above cap intentionally
+        saveEnergy({cur:ne,lastRegen:Date.now()});
+        return ne;
+      });
       prevLvsRef.current={...prevLvsRef.current,[mode]:newLv};
       setContent(getContent(xpByMode));
     }
@@ -938,17 +1011,25 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
   const handleAnswer=useCallback((id)=>{
     if(selected!==null)return;
     clearTimeout(revealRef.current);clearTimeout(autoAdv.current);
-    const cid=question.cid;const ok=String(id)===String(cid);
+    const cid=question.cid;
+    let ok;
+    if(question.type==='tempo'){
+      // Radius shrinks linearly from 50 at tpLv 1 down to 1 at tpLv 90
+      const tpLv=content.modeLevels?.tempo||1;
+      const radius=Math.round(50-(49/89)*(Math.min(90,tpLv)-1));
+      ok=Math.abs((parseInt(id)||0)-cid)<=radius;
+    }else{ok=String(id)===String(cid);}
     setSelected(id);
     setStats(s=>{const ns={...s,[mode]:{...s[mode],s:s[mode].s+(ok?1:0),f:s[mode].f+(ok?0:1)}};saveModeStats(ns);return ns;});
-    const newAtt={...dailyAttempts,[mode]:(dailyAttempts[mode]||0)+1};
-    setDailyAttempts(newAtt);saveDailyAttempts(newAtt);
     const newStreak=ok?(profile.streak||0)+1:0;
     setWeights(w=>({...w,[mode]:wUpd(w[mode]||initW(content[mode].pool||[]),cid,ok)}));
     if(!ok)setConf(c=>{const nm={...c};if(!nm[mode])nm[mode]={};if(!nm[mode][String(id)])nm[mode][String(id)]={};nm[mode][String(id)][String(cid)]=(nm[mode][String(id)][String(cid)]||0)+1;return nm;});
-    // XP + score only within daily attempt cap
-    const attBefore=dailyAttempts[mode]||0;
-    if(attBefore<MAX_ATT&&ok){
+    // Drain 1 energy per exercise
+    const newEnergy=Math.max(0,energy-1);
+    const drainTs=Date.now();
+    const newEnObj={cur:newEnergy,lastRegen:drainTs};
+    setEnergy(newEnergy);setRegenMs(drainTs);saveEnergy(newEnObj);
+    if(ok){
       const gain=question.type==='tempo'
         ?calcTempoXp(newStreak,Math.abs((parseInt(id)||0)-question.cid)/question.cid)
         :calcXp(newStreak);
@@ -963,17 +1044,16 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
       saveHistory(np.id,{date:toDay(),total:newScore});
     } else {
       const np={...profile,streak:newStreak};setProfile(np);saveProfile(np);
-      if(ok){setBounce('✓');setBounceKey(k=>k+1);}else{setBounce('✗');setBounceKey(k=>k+1);}
+      setBounce('✗');setBounceKey(k=>k+1);
     }
     try{const ctx=getCtx();ok?playOK(ctx):playNG(ctx);}catch{}
-    const justExhausted=(attBefore+1)>=MAX_ATT;
-    if(!justExhausted){
+    if(newEnergy>0){
       autoAdv.current=setTimeout(()=>{
         if(lvUpActiveRef.current){pendingNextRef.current=true;}
         else handleNextInner();
       },700);
     }
-  },[selected,question,mode,content,xpByMode,dailyScore,dailyAttempts,profile,revealed]);
+  },[selected,question,mode,content,xpByMode,dailyScore,energy,maxE,profile,revealed]);
 
   function handleNextInner(){
     clearTimeout(autoAdv.current);
@@ -1019,7 +1099,7 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
             <button className='hdr-icon-btn' onClick={()=>setShowStats(true)} title='Stats'>📊</button>
           </div>
         </div>
-        {/* Mode XP bar — always visible */}
+        {/* Mode XP bar */}
         <div className='hdr-xp-row'>
           <span style={{fontFamily:"'Fraunces',serif",fontSize:12,fontWeight:700,color:'#C6A585',minWidth:38}}>Lv {modeLv}</span>
           <div className='hdr-bar-wrap'>
@@ -1027,32 +1107,28 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
           </div>
           <span className='hdr-xp-frac'>{modeXpInfo.lv<MAX_LV?modeXpInfo.cur+'/'+modeXpInfo.need+' xp':'Max'}</span>
         </div>
-        {/* Streak + daily score — always visible */}
+        {/* Streak left + energy bar + daily score right */}
         <div className='hdr-meta-row'>
-          <span className='hdr-streak' style={{display:'flex',alignItems:'center',gap:5}}><StreakBadge streak={profile?.streak||0} size={36}/></span>
-          <span className='hdr-score'>Today: {(dailyScore||0).toLocaleString()} pts</span>
+          <div style={{display:'flex',alignItems:'center',gap:7,flex:1,minWidth:0}}>
+            <StreakBadge streak={profile?.streak||0} size={34}/>
+            <div style={{flex:1,minWidth:0}}><EnergyBar energy={energy} maxE={maxE} regenMs={regenMs}/></div>
+          </div>
+          <span className='hdr-score' style={{marginLeft:8}}>Today: {(dailyScore||0).toLocaleString()} pts</span>
         </div>
       </div>
-
-      {/* ── Attempt bar ── */}
-      {!modeExhausted&&(
-        <div className='att-bar-wrap'>
-          <div className='att-bar-track'><div className='att-bar-fill' style={{width:Math.round(modeAtt/MAX_ATT*100)+'%'}}/></div>
-        </div>
-      )}
 
       {/* ── Scrollable content ── */}
       <div className='r-scroll'>
 
-        {modeExhausted&&(
+        {energyEmpty&&(
           <div className='done-banner'>
-            <div style={{fontSize:28,marginBottom:8}}>✓</div>
-            <div style={{fontFamily:"'Fraunces',serif",fontSize:16,fontWeight:700,color:'#405147',marginBottom:4}}>Session complete</div>
-            <div style={{fontSize:12,color:'#9CB7B1',lineHeight:1.6}}>You have used your {MAX_ATT} {mode} attempts for today.{allExhausted?'':' Try another mode below.'}</div>
+            <div style={{fontSize:28,marginBottom:8}}>⚡</div>
+            <div style={{fontFamily:"'Fraunces',serif",fontSize:16,fontWeight:700,color:'#405147',marginBottom:4}}>Out of energy</div>
+            <div style={{fontSize:12,color:'#9CB7B1',lineHeight:1.6}}>Energy recovers 1 point every 5 minutes. Come back soon, or level up to earn more.</div>
           </div>
         )}
 
-        {!modeExhausted&&question&&(<>
+        {!energyEmpty&&question&&(<>
           <div className='r-qcard'>
             {question.type==='interval'&&<Piano na={question.na} nb={question.nb} octs={question.oct}/>}
             {question.type==='interval'&&(<div className='notes-row'>
@@ -1063,7 +1139,8 @@ function EarTraining({xpByMode,setXpByMode,profile,setProfile,dailyScore,setDail
             {question.type==='chord'&&<><span className='m-icon'>♪</span><div className='info-chip'>Random key · Chord quality</div></>}
             {question.type==='scale'&&<><span className='m-icon'>〜</span><div className='info-chip'>Random root · {question.dir==='desc'?'↓ Descending':'↑ Ascending'}</div></>}
             {question.type==='progression'&&<><span className='m-icon'>♫</span><div className='info-chip'>Random key · Progression</div></>}
-            {question.type==='tempo'&&<><span className='m-icon'>♩</span><div className='info-chip'>Listen to the pulse · What is the BPM?</div></>}
+            {question.type==='tempo'&&(()=>{const tpLv=content.modeLevels?.tempo||1;const r=Math.round(50-(49/89)*(Math.min(90,tpLv)-1));return(<><span className='m-icon'>♩</span><div className='info-chip'>Listen to the pulse · ±{r} BPM</div></>);})()}
+
             <button className={'play-btn'+(playing?' playing':'')} onClick={()=>doPlay(question)} disabled={playing}>
               {playing&&!revealed&&<div key={'pf'+round} className='play-fill' style={{animationName:'ri_playFill',animationDuration:fillDur+'ms',animationTimingFunction:'linear',animationFillMode:'forwards'}}/>}
               <span className='play-btn-inner'>
@@ -1124,28 +1201,41 @@ export default function App(){
   const[profile,setProfile]      =useState(null);
   const[xpByMode,setXpByMode]    =useState(EMPTY_XPM());
   const[dailyScore,setDailyScore]=useState(0);
-  const[dailyAttempts,setDA]     =useState({intervals:0,chords:0,scales:0,progressions:0,tempo:0});
+  const[energy,setEnergy]        =useState(BASE_ENERGY);
+  const[regenMs,setRegenMs]      =useState(Date.now());
   const[lb,setLb]                =useState([]);
   const[history,setHistory]      =useState([]);
   const refreshLb=()=>loadLB().then(b=>setLb(Array.isArray(b)?b:[])).catch(()=>{});
+  const curMaxE=maxEnergy(xpByMode);
+  // Real-time regen ticker at App level
+  useEffect(()=>{
+    if(energy>=curMaxE)return;
+    const id=setInterval(async()=>{
+      const e=await loadEnergy();
+      const ne=applyRegen(e,curMaxE);
+      if(ne.cur!==e.cur){setEnergy(ne.cur);setRegenMs(ne.lastRegen);saveEnergy(ne);}
+    },10000);
+    return()=>clearInterval(id);
+  },[energy,curMaxE]);
   useEffect(()=>{
     (async()=>{
       const p=await loadProfile();
       setProfile(p);
-      setXpByMode(p.xpByMode||EMPTY_XPM());
+      const xm=p.xpByMode||EMPTY_XPM();
+      setXpByMode(xm);
       const ds=await loadDailyScore();setDailyScore(ds||0);
-      const da=await loadDailyAttempts();setDA(da);
       refreshLb();
-      // load history at App level for Hub stats
-      if(p?.id){
-        loadHistory(p.id).then(h=>setHistory(Array.isArray(h)?h:[])).catch(()=>{});
-      }
+      if(p?.id){loadHistory(p.id).then(h=>setHistory(Array.isArray(h)?h:[])).catch(()=>{});}
+      // Load and apply offline regen
+      const e=await loadEnergy();
+      const ne=applyRegen(e,maxEnergy(xm));
+      setEnergy(ne.cur);setRegenMs(ne.lastRegen);
+      if(ne.cur!==e.cur)saveEnergy(ne);
     })();
   },[]);
   useEffect(()=>{
     if(screen==='hub'){
       refreshLb();
-      // refresh history when returning to hub
       if(profile?.id)loadHistory(profile.id).then(h=>setHistory(Array.isArray(h)?h:[])).catch(()=>{});
     }
   },[screen]);
@@ -1157,11 +1247,12 @@ export default function App(){
       xpByMode={xpByMode} setXpByMode={setXpByMode}
       profile={profile} setProfile={setProfile}
       dailyScore={dailyScore} setDailyScore={setDailyScore}
-      dailyAttempts={dailyAttempts} setDailyAttempts={setDA}
+      energy={energy} setEnergy={setEnergy}
+      maxE={curMaxE} regenMs={regenMs} setRegenMs={setRegenMs}
       initialMode={initMode}
       onBack={()=>setScreen('hub')}
       onScoreUpdate={refreshLb}
     />
   );
-  return(<><Styles/><SubjectHub xpByMode={xpByMode} profile={profile} lb={lb} history={history} dailyScore={dailyScore} dailyAttempts={dailyAttempts} onSelect={(s,m)=>{if(m)setInitMode(m);setScreen(s);}}/></>);
+  return(<><Styles/><SubjectHub xpByMode={xpByMode} profile={profile} lb={lb} history={history} dailyScore={dailyScore} energy={energy} maxE={curMaxE} regenMs={regenMs} onSelect={(s,m)=>{if(m)setInitMode(m);setScreen(s);}}/></>);
 }
